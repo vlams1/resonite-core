@@ -1,15 +1,21 @@
 //! Not for the faint of heart
 
-use std::fmt::Debug;
+use std::{fmt::Debug, io::Read};
 use serde::Deserialize;
 
+use super::{AnimXError, AnimXReader};
+
 // This trait is kinda funny, but I didn't want to deal with passing around an ``impl Write<W>`` since ``dyn TrackTrait`` got quite angry about it
-pub(crate) trait WriteBytes where {
+pub(crate) trait WriteBytes where Self: Debug {
     fn write(&self, write: &mut dyn FnMut(&[u8]));
+}
+pub(crate) trait ReadBytes where Self: Sized {
+    fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError>;
 }
 
 // These traits aren't great... oh well
-pub(crate) trait TrackTrait where Self: WriteBytes + Debug {}
+#[allow(private_bounds)]
+pub trait TrackTrait where Self: WriteBytes + Debug {}
 pub(crate) trait KeyframeTrait where Self: WriteBytes + Debug {}
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -18,6 +24,19 @@ pub enum TrackType {
     Discrete,
     Curve,
     Bezier,
+}
+
+impl TryFrom<u8> for TrackType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Raw),
+            1 => Ok(Self::Discrete),
+            2 => Ok(Self::Curve),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -36,6 +55,29 @@ pub enum ValueType {
     Color, Color32,
     #[serde(rename = "string")]
     OptString,
+}
+
+impl TryFrom<u8> for ValueType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        metamatch::metamatch!(match value {
+            #[expand(for (I,T) in enumerate([
+                Byte, Ushort, Ulong, Sbyte, Short,
+                Bool, Bool2, Bool3, Bool4,
+                Int, Int2, Int3, Int4,
+                Uint, Uint2, Uint3, Uint4,
+                Long, Long2, Long3, Long4,
+                Float, Float2, Float3, Float4,
+                FloatQ, Float2x2, Float3x3, Float4x4,
+                Double, Double2, Double3, Double4,
+                DoubleQ, Double2x2, Double3x3, Double4x4,
+                Color, Color32, OptString,
+            ]))]
+            I => Ok(Self::T),
+            _ => Err(()),
+        })
+    }
 }
 
 impl WriteBytes for ValueType {
@@ -93,23 +135,39 @@ impl WriteBytes for OptString {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
-pub struct Color { r: f32, g: f32, b: f32, a: f32 }
-
-impl WriteBytes for Color {
-    fn write(&self, write: &mut dyn FnMut(&[u8])) {
-        write(&[self.r.to_le_bytes(),self.g.to_le_bytes(),self.b.to_le_bytes(),self.a.to_le_bytes()].iter().flatten().cloned().collect::<Vec<_>>()[..]);
+impl ReadBytes for OptString {
+    fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+        reader.read_nullable_string().map(|v| OptString(v.unwrap_or_default()))
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
-pub struct Color32 { r: u8, g: u8, b: u8, a: u8 }
+metamatch::quote! {
+    [<for (name, internal) in [(Color, f32), (Color32, u8)]>]
+        #[derive(Debug, Deserialize, Clone, Copy)]
+        pub struct [<ident(str(name))>]  {
+            [<for field in [r,g,b,a]>]
+                [<ident(str(field))>]: [<ident(str(internal))>],
+            [</for>]
+        }
+        
+        impl WriteBytes for [<ident(str(name))>] {
+            fn write(&self, write: &mut dyn FnMut(&[u8])) {
+                [<for field in [r,g,b,a]>]
+                    self.[<ident(str(field))>].write(write);
+                [</for>]
+            }
+        }
 
-impl WriteBytes for Color32 {
-    fn write(&self, write: &mut dyn FnMut(&[u8])) {
-        let Color32{r,g,b,a} = *self;
-        write(&[r,g,b,a]);
-    }
+        impl ReadBytes for [<ident(str(name))>]  {
+            fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+                Ok(Self{
+                [<for field in [r,g,b,a]>]
+                    [<ident(str(field))>]: [<ident(str(internal))>]::read(reader)?,
+                [</for>]
+                })
+            }
+        }
+    [</for>]
 }
 
 pub type Byte = u8;
@@ -150,23 +208,70 @@ impl WriteBytes for Bool4 {
     }
 }
 
+impl ReadBytes for Bool {
+    fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+        Ok(reader.read_bool()?)
+    }
+}
+
 metamatch::quote! {
-    [<for name in [Byte, Sbyte, Ushort, Ulong, Short, Int, Long, Uint, Float, Double]>]
-        impl WriteBytes for [<ident(str(name))>] {
-            fn write(&self, write: &mut dyn FnMut(&[u8])) {
-                write(&self.to_le_bytes());
+    [<for I in 2..5>]
+        impl ReadBytes for [<ident("Bool" + str(I))>] {
+            fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+                let byte = reader.read_u8()?;
+                Ok(Self{
+                    [<for index in 0..I>]
+                        [<let field = [x,y,z,w][index]>]
+                        [<ident(str(field))>]: byte >> [<index>] & 1 == 1,
+                    [</for>]
+                })
             }
         }
     [</for>]
 }
 
 metamatch::quote! {
-    [<for name in [Float2x2, Float3x3, Float4x4, Double2x2, Double3x3, Double4x4]>]
+    [<for (name, size) in [(Byte, 1), (Sbyte, 1), (Ushort, 2), (Ulong, 8), (Short, 2), (Int, 4), (Long, 8), (Uint, 4), (Float, 4), (Double, 8)]>]
         impl WriteBytes for [<ident(str(name))>] {
             fn write(&self, write: &mut dyn FnMut(&[u8])) {
-                self.iter().for_each(|i| i.iter().for_each(|i| i.write(write)))
+                write(&self.to_le_bytes());
             }
         }
+
+        impl ReadBytes for [<ident(str(name))>]  {
+            fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+                let mut buf = [0u8; [<(size)>]];
+                reader.read_into(&mut buf)?;
+                Ok(Self::from_le_bytes(buf))
+            }
+        }
+    [</for>]
+}
+
+metamatch::quote! {
+    [<for type in [Float, Double]>]
+        [<for size in 2..5>]
+            [<let name = str(type) + str(size) + "x" + str(size)>]
+            impl WriteBytes for [<ident(str(name))>] {
+                fn write(&self, write: &mut dyn FnMut(&[u8])) {
+                    self.iter().for_each(|i| i.iter().for_each(|i| i.write(write)))
+                }
+            }
+
+            impl ReadBytes for [<ident(str(name))>] {
+                fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+                    Ok([
+                        [<for a in 0..size>]
+                        [
+                            [<for b in 0..size>]
+                                [<ident(str(type))>]::read(reader)?,
+                            [</for>]
+                        ],
+                        [</for>]
+                    ])
+                }
+            }
+        [</for>]
     [</for>]
 }
 
@@ -179,7 +284,7 @@ metamatch::quote! {
             pub struct [<ident(str(name) + str(range))>] {
                 [<for field in 0..range>]
                     [<let field_name = [x,y,z,w][field]>]
-                    [<ident(str(field_name))>]: [<ident(str(internal))>],
+                    pub [<ident(str(field_name))>]: [<ident(str(internal))>],
                 [</for>]
             }
 
@@ -190,6 +295,17 @@ metamatch::quote! {
                         [<let field_name = [x,y,z,w][field]>]
                         write( &self.[<ident(str(field_name))>].to_le_bytes() );
                     [</for>]
+                }
+            }
+
+            impl ReadBytes for [<ident(str(name) + str(range))>]  {
+                fn read(reader: &mut AnimXReader<impl Read>) -> Result<Self, AnimXError> {
+                    Ok(Self {
+                        [<for field in 0..range>]
+                            [<let field_name = [x,y,z,w][field]>]
+                            [<ident(str(field_name))>]: [<ident(str(name))>]::read(reader)?,
+                        [</for>]
+                    })
                 }
             }
             [</if>]

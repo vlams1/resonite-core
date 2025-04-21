@@ -3,16 +3,13 @@
 pub mod types;
 use types::*;
 
-use std::{fmt::Debug, io::{BufWriter, Write}};
+use std::{fmt::Debug, io::{BufWriter, Read, Write}};
 use serde::{de::{Error, IgnoredAny, Visitor}, Deserialize, Deserializer};
 
 /// The overarching type for animations
 /// 
-/// This type implements ``serde::Deserialize`` and is meant to be deserealized from an AnimJ (JSON) structure
-/// 
-/// There is also a function for writing an AnimX stream (Binary)
-/// 
-/// Deserealizing AnimX is currently **not** supported
+/// This type implements ``serde::Deserialize`` and is meant to be deserealized from an AnimJ (JSON) structure\
+/// There are also functions for writing and reading AnimX streams (Binary)
 #[allow(private_interfaces)]
 #[derive(Debug, Default)]
 pub struct Animation {
@@ -22,8 +19,7 @@ pub struct Animation {
 }
 
 impl Animation {
-    /// Function for writing data as an AnimX stream
-    /// 
+    /// Function for writing data as an AnimX stream\
     /// Compression is not yet supported.
     /// 
     /// ```
@@ -50,6 +46,249 @@ impl Animation {
         write(&[0x00,]);                    // Encoding flag (just none for now)
         for track in &self.tracks {
             track.write(write);             // Tracks
+        }
+    }
+
+    /// Function for reading data from an AnimX stream\
+    /// Compression is not yet supported.
+    /// 
+    /// ```
+    /// use resonite_core::animation::Animation;
+    /// 
+    /// let reader = BufReader::new(/* AnimX */);
+    /// let anim = Animation::from_animx(reader)?;
+    /// ```
+    pub fn from_animx(data: impl Read) -> Result<Animation, AnimXError> {
+        let mut output = Animation::default();
+        let mut reader = AnimXReader(data);
+
+        if reader.read_string()? != "AnimX" { Err(AnimXError::IncorrectHeader)? }
+        if reader.read_i32()? != 1 { Err(AnimXError::UnsupportedVersion)? }
+
+        let tracks = reader.read_varint()?;
+        output.global_duration = Some(reader.read_f32()?);
+        output.name = Some(reader.read_string()?);
+
+        if reader.read_u8()? != 0 { Err(AnimXError::UnsupportedEncoding)? }
+
+        for _ in 0..tracks {
+            let track_type: TrackType = reader.read_u8()?.try_into().map_err(|_| AnimXError::IncorrectTrackType)?;
+            let value_type: ValueType = reader.read_u8()?.try_into().map_err(|_| AnimXError::IncorrectValueType)?;
+
+            let node = Some(reader.read_string()?);
+            let property = Some(reader.read_string()?);
+            let frames = reader.read_varint()?;
+
+            match track_type {
+                TrackType::Raw => {
+                    let interval = Some(reader.read_f32()?);
+                    metamatch::metamatch!(match value_type {
+                        #[expand(for T in [
+                            Byte, Ushort, Ulong, Sbyte, Short,
+                            Bool, Bool2, Bool3, Bool4,
+                            Int, Int2, Int3, Int4,
+                            Uint, Uint2, Uint3, Uint4,
+                            Long, Long2, Long3, Long4,
+                            Float, Float2, Float3, Float4,
+                            FloatQ, Float2x2, Float3x3, Float4x4,
+                            Double, Double2, Double3, Double4,
+                            DoubleQ, Double2x2, Double3x3, Double4x4,
+                            Color, Color32, OptString,
+                        ])]
+                        ValueType::T => {
+                            let mut keyframes = Vec::new();
+                            for _ in 0..frames {
+                                keyframes.push(T::read(&mut reader)?);
+                            }
+                            output.tracks.push(
+                                Box::new(
+                                    Track{
+                                        track_type,
+                                        value_type,
+                                        data: RawData {
+                                            node,
+                                            property,
+                                            interval,
+                                            keyframes,
+                                        },
+                                    }
+                                )
+                            );
+                        },
+                    })
+                },
+                TrackType::Discrete => {
+                    metamatch::metamatch!(match value_type {
+                        #[expand(for T in [
+                            Byte, Ushort, Ulong, Sbyte, Short,
+                            Bool, Bool2, Bool3, Bool4,
+                            Int, Int2, Int3, Int4,
+                            Uint, Uint2, Uint3, Uint4,
+                            Long, Long2, Long3, Long4,
+                            Float, Float2, Float3, Float4,
+                            FloatQ, Float2x2, Float3x3, Float4x4,
+                            Double, Double2, Double3, Double4,
+                            DoubleQ, Double2x2, Double3x3, Double4x4,
+                            Color, Color32, OptString,
+                        ])]
+                        ValueType::T => {
+                            let mut keyframes = Vec::new();
+                            for _ in 0..frames {
+                                let time = reader.read_f32()?;
+                                let value = T::read(&mut reader)?;
+                                keyframes.push(DiscreteKeyframe{time, value});
+                            }
+                            output.tracks.push(
+                                Box::new(
+                                    Track{
+                                        track_type,
+                                        value_type,
+                                        data: DiscreteData {
+                                            node,
+                                            property,
+                                            keyframes,
+                                        },
+                                    }
+                                )
+                            );
+                        },
+                    })
+                },
+                TrackType::Curve => {
+                    let info = Bool2::read(&mut reader)?;
+                    let mut interpolations = Vec::new();
+                    for _ in if info.x {0..frames} else {0..1} {
+                        interpolations.push(Interpolation::try_from(reader.read_u8()?).map_err(|_| AnimXError::IncorrectInterpolationType)?);
+                    }
+                    
+                    metamatch::metamatch!(match value_type {
+                        #[expand(for T in [
+                            OptString,
+                        ])]
+                        ValueType::T => {
+                            let mut keyframes = Vec::new();
+                            for i in 0..frames {
+                                let time = reader.read_f32()?;
+                                let value = T::read(&mut reader)?;
+                                let interpolation = interpolations[if info.x {i} else {0}];
+                                keyframes.push(CurveKeyframe{time, value, interpolation, left_tangent: None, right_tangent: None});
+                            }
+                            if info.y {
+                                for i in 0..frames {
+                                    let keyframe = &mut keyframes[i];
+                                    keyframe.left_tangent = Some(T::read(&mut reader)?);
+                                    keyframe.right_tangent = Some(T::read(&mut reader)?);
+                                }
+                            }
+                            output.tracks.push(
+                                Box::new(
+                                    Track{
+                                        track_type,
+                                        value_type,
+                                        data: CurveData {
+                                            node,
+                                            property,
+                                            keyframes,
+                                        },
+                                    }
+                                )
+                            );
+                        },
+                        _ => todo!(),
+                    })
+                },
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+#[derive(Debug)]
+pub enum AnimXError {
+    IncorrectHeader,
+    UnsupportedVersion,
+    UnsupportedEncoding,
+    IncorrectTrackType,
+    IncorrectValueType,
+    IncorrectInterpolationType,
+    IoError(std::io::Error),
+    FromUtf8Error(std::string::FromUtf8Error),
+}
+
+impl From<std::io::Error> for AnimXError {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(e)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for AnimXError {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        Self::FromUtf8Error(e)
+    }
+}
+
+pub(crate) struct AnimXReader<R>(R) where R: Read;
+
+impl<R: Read> AnimXReader<R> {
+    fn read_into(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.0.read_exact(buf)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        self.0.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn read_bool(&mut self) -> std::io::Result<bool> {
+        let mut buf = [0u8;1];
+        self.0.read_exact(&mut buf)?;
+        Ok(buf[0] == 1)
+    }
+
+    fn read_u8(&mut self) -> std::io::Result<u8> {
+        let mut buf = [0u8;1];
+        self.0.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_i32(&mut self) -> std::io::Result<i32> {
+        let mut buf = [0u8;4];
+        self.0.read_exact(&mut buf)?;
+        Ok(i32::from_le_bytes(buf))
+    }
+
+    fn read_f32(&mut self) -> std::io::Result<f32> {
+        let mut buf = [0u8;4];
+        self.0.read_exact(&mut buf)?;
+        Ok(f32::from_le_bytes(buf))
+    }
+
+    fn read_varint(&mut self) -> std::io::Result<usize> {
+        let mut data = 0;
+        let mut shift = 0;
+        let mut buf = [0u8;1];
+        while { self.0.read_exact(&mut buf)?; buf[0] & 128 == 128 } {
+            data += (buf[0] as usize & 127) << shift;
+            shift += 7;
+        }
+        data += (buf[0] as usize & 127) << shift;
+
+        Ok(data)
+    }
+
+    fn read_string(&mut self) -> Result<String, AnimXError> {
+        let len = self.read_varint()?;
+        Ok(String::from_utf8(self.read_bytes(len)?)?)
+    }
+
+    fn read_nullable_string(&mut self) -> Result<Option<String>, AnimXError> {
+        if self.read_bool()? {
+            self.read_string().map(|s| Some(s))
+        } else {
+            Ok(None)
         }
     }
 }
@@ -296,4 +535,18 @@ pub enum Interpolation {
     Linear,
     Tangent,
     CubicBezier,
+}
+
+impl TryFrom<u8> for Interpolation {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Hold),
+            1 => Ok(Self::Linear),
+            2 => Ok(Self::Tangent),
+            3 => Ok(Self::CubicBezier),
+            _ => Err(()),
+        }
+    }
 }
