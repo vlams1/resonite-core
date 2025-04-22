@@ -3,7 +3,7 @@ name = "resonite-core"
 description = "Rust implementations of Resonite formats"
 authors = ["Vlams"]
 
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 readme = "README.md"

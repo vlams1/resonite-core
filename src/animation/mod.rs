@@ -163,7 +163,16 @@ impl Animation {
                     
                     metamatch::metamatch!(match value_type {
                         #[expand(for T in [
-                            OptString,
+                            Byte, Ushort, Ulong, Sbyte, Short,
+                            Bool, Bool2, Bool3, Bool4,
+                            Int, Int2, Int3, Int4,
+                            Uint, Uint2, Uint3, Uint4,
+                            Long, Long2, Long3, Long4,
+                            Float, Float2, Float3, Float4,
+                            FloatQ, Float2x2, Float3x3, Float4x4,
+                            Double, Double2, Double3, Double4,
+                            DoubleQ, Double2x2, Double3x3, Double4x4,
+                            Color, Color32, OptString,
                         ])]
                         ValueType::T => {
                             let mut keyframes = Vec::new();
@@ -194,7 +203,6 @@ impl Animation {
                                 )
                             );
                         },
-                        _ => todo!(),
                     })
                 },
                 _ => unreachable!(),
