@@ -146,7 +146,7 @@ metamatch::quote! {
         #[derive(Debug, Deserialize, Clone, Copy)]
         pub struct [<ident(str(name))>]  {
             [<for field in [r,g,b,a]>]
-                [<ident(str(field))>]: [<ident(str(internal))>],
+                pub [<ident(str(field))>]: [<ident(str(internal))>],
             [</for>]
         }
         
